@@ -1,0 +1,19 @@
+{
+  "outlet_nhdplusid": 23002900012900,
+  "n_segments": 2990,
+  "n_hrus": 2947,
+  "is_dag": true,
+  "all_segments_reach_outlet": true,
+  "null_downstream_nonoutlet": 0,
+  "duplicate_parent_nhdplusid": 0,
+  "segments_without_hru": 43,
+  "segments_in_waterbody": 386,
+  "small_hrus": 0,
+  "routed_area_km2": 2069.333,
+  "unrouted_area_km2": 54.696,
+  "unrouted_waterbody_area_km2": 0.0,
+  "n_unrouted_catchments": 277,
+  "outlet_totdasqkm_vaa": 2069.85840032,
+  "routed_area_difference_pct": -0.025,
+  "segments_flagged_divergence": 129
+}
