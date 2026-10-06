@@ -80,7 +80,8 @@ from Routing import (
 )
 from Plotting import DomainPlotter
 
-
+import geopandas as gpd
+from fiona import listlayers
 # =============================================================================
 # User configuration
 # =============================================================================
@@ -92,7 +93,7 @@ OUTPUT_DIR = Path(
     r"\PRMS_Gallatin\Domain_Builder\Domain_Files"
 )
 
-GPKG_NAME = "nhdhr.gpkg"
+GPKG_NAME = "upper_gallatin_nhdhr.gpkg"
 
 WORK_CRS = "EPSG:5070"
 
@@ -106,7 +107,7 @@ OUTLET_SOURCE_ID: str | None = None
 # ---------------------------------------------------------------------------
 
 # Set False once the selected source layers are already available locally.
-RUN_DOWNLOAD = True
+RUN_DOWNLOAD = False
 
 # Set True to create or refresh:
 #   prepared_flowlines
@@ -172,8 +173,8 @@ LOAD_LAYERS = (
 # mapping below.
 SOURCE_LAYER_MAP = {
     "flowline": "merged_flowlines",
-    "catchment": "merged_catchments",
-    "waterbody": "merged_waterbodies",
+    "catchment": "NHDcatchment",
+    "waterbody": "NHDwaterbody",
 }
 
 # Default source is the same GeoPackage used by the downloader. To load Arc
@@ -388,6 +389,61 @@ def run_plotting_stage(
     return outputs
 
 
+def print_geopackage_inventory(
+    gpkg_path: Path,
+) -> None:
+    """Prints GeoPackage layer names, feature counts, and geometry types.
+
+    Args:
+        gpkg_path: GeoPackage to inspect.
+    """
+    print("\n" + "=" * 78)
+    print("GEOPACKAGE LAYER INVENTORY")
+    print("=" * 78)
+    print(f"GeoPackage: {gpkg_path}")
+
+    if not gpkg_path.exists():
+        print("GeoPackage does not exist; no layer inventory is available.")
+        return
+
+    layer_names = listlayers(gpkg_path)
+
+    if not layer_names:
+        print("No layers found in the GeoPackage.")
+        return
+
+    print(f"\n{'Layer name':<35} {'Features':>12}   Geometry type")
+    print("-" * 78)
+
+    for layer_name in sorted(layer_names):
+        try:
+            gdf = gpd.read_file(gpkg_path, layer=layer_name)
+
+            geometry_types = (
+                ", ".join(
+                    sorted(
+                        str(value)
+                        for value in gdf.geom_type.dropna().unique()
+                    )
+                )
+                if not gdf.empty
+                else "Empty"
+            )
+
+            print(
+                f"{layer_name:<35} "
+                f"{len(gdf):>12,}   "
+                f"{geometry_types}"
+            )
+
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"{layer_name:<35} "
+                f"{'ERROR':>12}   "
+                f"{type(error).__name__}: {error}"
+            )
+
+    print("-" * 78)
 # =============================================================================
 # Main
 # =============================================================================
@@ -418,6 +474,8 @@ def main() -> None:
 
     if RUN_PLOTTING:
         run_plotting_stage(source_config)
+
+    print_geopackage_inventory(source_config.gpkg_path)
 
     print("\n" + "=" * 78)
     print("UPPER GALLATIN DOMAIN BUILD COMPLETE")

@@ -1025,7 +1025,7 @@ def main() -> None:
     """Creates standard routing QA figures from the current GeoPackage."""
     gpkg_path = Path(
         r"C:\Users\CND367\Documents\Python_Scripts\PRMS"
-        r"\PRMS_Gallatin\Domain_Builder\Domain_Files\upper_gallatin_nhdhr.gpkg"
+        r"\PRMS_Gallatin\Domain_Builder\Domain_Files\PlusHR_UG.gdb"
     )
 
     qa_dir = gpkg_path.parent / "domain_qa"
