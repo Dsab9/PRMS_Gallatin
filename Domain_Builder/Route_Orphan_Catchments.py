@@ -1691,6 +1691,7 @@ class OrphanCatchmentRouter:
         self.active_hru_sindex = (
             self.active_hrus.sindex
         )
+        self.catchment_sindex = self.catchments.sindex
 
     def route_orphans(
         self,
@@ -1737,6 +1738,8 @@ class OrphanCatchmentRouter:
                 recovery_records.append(recovery_record)
 
         results = pd.DataFrame(result_records)
+
+        results = self._flag_circular_routing(results)
 
         outlet_points = self._records_to_gdf(
             point_records
@@ -1838,6 +1841,7 @@ class OrphanCatchmentRouter:
         strict_assignment = self._find_trace_assignment(
             strict_cells,
             method_prefix="dem_trace",
+            own_catchment_id=catchment_id,
         )
 
         all_cells = strict_cells.copy()
@@ -1898,7 +1902,8 @@ class OrphanCatchmentRouter:
                         recovery_assignment,
                         post_recovery_cells,
                     ) = self._route_from_recovery_exit(
-                        recovery
+                        recovery,
+                        catchment_id,
                     )
 
                     self._record_recovery_metrics(
@@ -2010,6 +2015,7 @@ class OrphanCatchmentRouter:
     def _route_from_recovery_exit(
         self,
         recovery: dict[str, Any],
+        own_catchment_id: str,
     ) -> tuple[
         dict[str, Any] | None,
         list[tuple[int, int]],
@@ -2027,6 +2033,7 @@ class OrphanCatchmentRouter:
         assignment = self._find_trace_assignment(
             post_recovery_cells,
             method_prefix="dem_elevation_buffer",
+            own_catchment_id=own_catchment_id,
         )
 
         return assignment, post_recovery_cells
@@ -2072,9 +2079,12 @@ class OrphanCatchmentRouter:
             assigned_source_id=str(
                 assignment["source_id"]
             ),
-            assigned_segment_id=int(
-                assignment["segment_id"]
+            assigned_segment_id=(
+                None
+                if assignment["segment_id"] is None
+                else int(assignment["segment_id"])
             ),
+            assigned_catchment_id=assignment.get("catchment_id"),
             routing_method=str(
                 assignment["routing_method"]
             ),
@@ -2132,9 +2142,12 @@ class OrphanCatchmentRouter:
             assigned_source_id=str(
                 assignment["source_id"]
             ),
-            assigned_segment_id=int(
-                assignment["segment_id"]
+            assigned_segment_id=(
+                None
+                if assignment["segment_id"] is None
+                else int(assignment["segment_id"])
             ),
+            assigned_catchment_id=assignment.get("catchment_id"),
             routing_method=method,
             routing_confidence=confidence,
             routing_notes=(
@@ -2157,6 +2170,7 @@ class OrphanCatchmentRouter:
             "source_id": source_id,
             "assigned_source_id": None,
             "assigned_segment_id": None,
+            "assigned_catchment_id": None,
             "routing_method": "unresolved",
             "routing_confidence": "low",
             "routing_notes": None,
@@ -2276,8 +2290,14 @@ class OrphanCatchmentRouter:
         self,
         trace_cells: list[tuple[int, int]],
         method_prefix: str,
+        own_catchment_id: str,
     ) -> dict[str, Any] | None:
-        """Finds first active segment or HRU touched by a strict trace."""
+        """Finds first segment, active HRU, or other catchment on a trace.
+
+        Priority at each cell is active segment, then active HRU, then any
+        other catchment (strict containment). The orphan's own polygon is
+        never a valid receiver.
+        """
         for trace_index, (
             row,
             col,
@@ -2333,6 +2353,26 @@ class OrphanCatchmentRouter:
                     "routing_notes": (
                         "Strict D8 trace entered an active routed "
                         "catchment before reaching a segment."
+                    ),
+                    "trace_index": int(trace_index),
+                }
+
+            other_catchment = self._match_any_catchment(
+                point=point,
+                own_catchment_id=own_catchment_id,
+            )
+
+            if other_catchment is not None:
+                return {
+                    **other_catchment,
+                    "receiver_type": "catchment",
+                    "routing_method": (
+                        f"{method_prefix}_to_catchment"
+                    ),
+                    "routing_confidence": "medium",
+                    "routing_notes": (
+                        "Strict D8 trace entered another catchment that "
+                        "is not an active routed HRU."
                     ),
                     "trace_index": int(trace_index),
                 }
@@ -2417,6 +2457,101 @@ class OrphanCatchmentRouter:
             ),
         }
 
+    def _match_any_catchment(
+        self,
+        point: Point,
+        own_catchment_id: str,
+    ) -> dict[str, Any] | None:
+        """Finds another catchment that contains a trace point.
+
+        Strict containment only (no search distance), so a trace is never
+        sent to a neighbor it merely passes near. Used after active
+        segment/HRU matching fails.
+        """
+        hits = self.catchment_sindex.query(
+            point,
+            predicate="intersects",
+        )
+
+        if len(hits) == 0:
+            return None
+
+        candidates = self.catchments.iloc[list(hits)]
+
+        candidates = candidates[
+            candidates["catchment_id"].astype(str)
+            != own_catchment_id
+        ]
+
+        if candidates.empty:
+            return None
+
+        selected = candidates.sort_values(
+            "catchment_id"
+        ).iloc[0]
+
+        return {
+            "source_id": str(selected["source_id"]),
+            "catchment_id": str(selected["catchment_id"]),
+            "segment_id": None,
+        }
+
+    @staticmethod
+    def _flag_circular_routing(
+        results: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Clears proposals that route orphans in a circle (A -> B -> A)."""
+        if results.empty:
+            return results
+
+        output = results.copy()
+
+        next_id = {
+            str(c): str(t)
+            for c, t in zip(
+                output["catchment_id"],
+                output["assigned_catchment_id"],
+            )
+            if pd.notna(t)
+        }
+
+        in_cycle: set[str] = set()
+
+        for start in next_id:
+            path: list[str] = []
+            node = start
+
+            while node in next_id and node not in path:
+                path.append(node)
+                node = next_id[node]
+
+            if node in path:
+                in_cycle.update(path[path.index(node):])
+
+        if not in_cycle:
+            return output
+
+        mask = output["catchment_id"].astype(str).isin(in_cycle)
+
+        output.loc[
+            mask,
+            [
+                "assigned_source_id",
+                "assigned_segment_id",
+                "assigned_catchment_id",
+            ],
+        ] = None
+
+        output.loc[mask, "routing_method"] = "circular_routing"
+        output.loc[mask, "routing_confidence"] = "low"
+        output.loc[mask, "manual_review"] = 1
+        output.loc[mask, "routing_notes"] = (
+            "Proposed catchment routing forms a loop among orphan "
+            "catchments, so the proposal was removed."
+        )
+
+        return output
+
     def _build_line_from_cells(
         self,
         cells: list[tuple[int, int]],
@@ -2466,6 +2601,7 @@ class OrphanCatchmentRouter:
 
         text_fields = (
             "proposed_source_id",
+            "proposed_catchment_id",
             "orphan_routing_method",
             "orphan_routing_confidence",
             "orphan_routing_status",
@@ -2559,6 +2695,12 @@ class OrphanCatchmentRouter:
                 )
                 else "sink_or_unresolved"
             )
+
+            if result["routing_method"] == "circular_routing":
+                updated.at[
+                    index,
+                    "orphan_routing_status",
+                ] = "circular_routing"
 
             for result_field, output_field in (
                 (
@@ -2654,12 +2796,21 @@ class OrphanCatchmentRouter:
                     result["assigned_source_id"]
                 )
 
-                updated.at[
-                    index,
-                    "proposed_segment_id",
-                ] = int(
-                    result["assigned_segment_id"]
-                )
+                if pd.notna(result["assigned_segment_id"]):
+                    updated.at[
+                        index,
+                        "proposed_segment_id",
+                    ] = int(
+                        result["assigned_segment_id"]
+                    )
+
+                if pd.notna(result["assigned_catchment_id"]):
+                    updated.at[
+                        index,
+                        "proposed_catchment_id",
+                    ] = str(
+                        result["assigned_catchment_id"]
+                    )
 
         return updated
 
@@ -2721,6 +2872,7 @@ class OrphanCatchmentRouter:
                 "source_id",
                 "assigned_source_id",
                 "assigned_segment_id",
+                "assigned_catchment_id",
                 "routing_method",
                 "routing_confidence",
                 "orphan_outlet_row",
@@ -2764,6 +2916,7 @@ class OrphanCatchmentRouter:
                 "source_id",
                 "assigned_source_id",
                 "assigned_segment_id",
+                "assigned_catchment_id",
                 "routing_method",
                 "routing_confidence",
                 "strict_trace_cell_count",
@@ -2804,6 +2957,7 @@ class OrphanCatchmentRouter:
                 "source_id",
                 "assigned_source_id",
                 "assigned_segment_id",
+                "assigned_catchment_id",
                 "routing_method",
                 "routing_confidence",
                 "sink_recovery_attempted",
@@ -2862,6 +3016,7 @@ class OrphanCatchmentRouter:
             "divergence",
             "proposed_source_id",
             "proposed_segment_id",
+            "proposed_catchment_id",
             "orphan_routing_method",
             "orphan_routing_confidence",
             "orphan_routing_status",
@@ -2966,6 +3121,7 @@ class OrphanCatchmentRouter:
         result_fields = [
             "catchment_id",
             "assigned_segment_id",
+            "assigned_catchment_id",
             "routing_method",
             "routing_confidence",
         ]
@@ -2994,6 +3150,14 @@ class OrphanCatchmentRouter:
         ):
             if pd.notna(segment_id):
                 hru_by_segment.setdefault(int(segment_id), geometry)
+
+        catchment_by_id = {
+            str(c): g
+            for c, g in zip(
+                self.catchments["catchment_id"],
+                self.catchments.geometry,
+            )
+        }
 
         segment_geometry = {
             int(segment_id): geometry
@@ -3080,6 +3244,7 @@ class OrphanCatchmentRouter:
             "no_valid_dem_cell",
             "dem_elevation_buffer_unresolved",
             "unresolved",
+            "circular_routing",
         }
 
         n_strict = 0
@@ -3096,7 +3261,9 @@ class OrphanCatchmentRouter:
             )
             segment_id = row.assigned_segment_id
 
-            if pd.isna(segment_id):
+            catchment_target = row.assigned_catchment_id
+
+            if pd.isna(segment_id) and pd.isna(catchment_target):
                 if method in unresolved_methods:
                     n_unresolved += 1
                     axis.scatter(
@@ -3112,8 +3279,14 @@ class OrphanCatchmentRouter:
                     )
                 continue
 
-            segment_id = int(segment_id)
-            receiver_geometry = hru_by_segment.get(segment_id)
+            if pd.notna(catchment_target):
+                receiver_geometry = catchment_by_id[
+                    str(catchment_target)
+                ]
+            else:
+                segment_id = int(segment_id)
+                receiver_geometry = hru_by_segment.get(segment_id)
+
             ends_at_segment = receiver_geometry is None
 
             if ends_at_segment:
@@ -3295,9 +3468,811 @@ class OrphanCatchmentRouter:
         }
 
 
-# =============================================================================
-# Standalone runner
-# =============================================================================
+class OrphanAdoptionConfig:
+    """Stores settings for applying reviewed ``proposed_source_id`` values.
+
+    Args:
+        gpkg_path: Datasource holding the prepared ``model_segments`` layer
+            (read-only here).
+        output_gpkg_path: Datasource holding the edited orphan layer and
+            receiving the new layers.
+        output_dir: Folder for CSVs and the JSON report.
+        edited_layer: Orphan-routing layer that was manually edited.
+        segment_layer: Active segment layer.
+        output_catchment_layer: New full catchment layer to write.
+        output_hru_layer: New trimmed PRMS HRU layer to write.
+        results_csv_path: Original automatic results table, used only to
+            label edits as auto-accepted or manual. Defaults to
+            ``output_dir/orphan_routing_results.csv``.
+        orphan_statuses: ``routing_status`` values treated as orphans.
+        strict: Raise on invalid edits or routing cycles instead of skipping.
+        extra_hru_fields: Additional catchment fields to keep in the HRU
+            layer beyond the core PRMS fields.
+        lake_waterbody_fraction: If set, HRUs with ``waterbody_frac`` at or
+            above this value get ``hru_type`` 2 (lake). Default None keeps
+            every HRU as land (1).
+    """
+
+    ACRE_M2 = 4046.8564224
+
+    def __init__(
+        self,
+        gpkg_path: Path,
+        output_gpkg_path: Path,
+        output_dir: Path,
+        edited_layer: str = "model_catchments_orphan_routed",
+        segment_layer: str = "model_segments",
+        output_catchment_layer: str = "model_catchments_orphan_adopted",
+        output_hru_layer: str = "model_hrus_orphan_adopted",
+        results_csv_path: Path | None = None,
+        orphan_statuses: tuple[str, ...] = (
+            OrphanRoutingConfig.DEFAULT_ORPHAN_STATUSES
+        ),
+        strict: bool = True,
+        extra_hru_fields: tuple[str, ...] = (),
+        lake_waterbody_fraction: float | None = None,
+    ) -> None:
+        """Initializes adoption settings."""
+        self.gpkg_path = Path(gpkg_path)
+        self.output_gpkg_path = Path(output_gpkg_path)
+        self.output_dir = Path(output_dir)
+        self.edited_layer = str(edited_layer)
+        self.segment_layer = str(segment_layer)
+        self.output_catchment_layer = str(output_catchment_layer)
+        self.output_hru_layer = str(output_hru_layer)
+        self.results_csv_path = (
+            Path(results_csv_path)
+            if results_csv_path is not None
+            else self.output_dir / "orphan_routing_results.csv"
+        )
+        self.orphan_statuses = tuple(orphan_statuses)
+        self.strict = bool(strict)
+        self.extra_hru_fields = tuple(extra_hru_fields)
+        self.lake_waterbody_fraction = lake_waterbody_fraction
+
+
+class OrphanRoutingAdopter:
+    """Applies reviewed routing and builds the PRMS HRU layer.
+
+    Every catchment is retained and every catchment becomes an HRU, including
+    sinks.
+
+    Catchment layer (``output_catchment_layer``):
+        - Each orphan with a ``proposed_source_id`` gets
+          ``to_source_id = proposed_source_id``.
+        - Every catchment whose ``to_source_id`` points to a known source
+          gets ``routing_status = "routed"`` and a filled ``to_segment_id``.
+        - ``is_active_hru`` is 1 for all catchments (the prior value is kept
+          in ``was_active_hru``), and the old status in
+          ``orphan_original_status``.
+
+    HRU layer (``output_hru_layer``), trimmed to PRMS fields:
+        hru_id, catchment_id, source_id, hru_segment, hru_area (acres),
+        hru_lat, hru_lon, hru_type, geometry.
+
+    ``hru_segment`` is the model segment the HRU contributes lateral flow to:
+    its own segment if its flowline is in the active network, otherwise the
+    first segment reached by following ``to_source_id``. HRUs whose chain
+    never reaches a segment (true sinks) get 0.
+    """
+
+    REQUIRED_EDITED_FIELDS = (
+        "catchment_id",
+        "source_id",
+        "routing_status",
+        "proposed_source_id",
+    )
+
+    REQUIRED_SEGMENT_FIELDS = (
+        "segment_id",
+        "source_id",
+    )
+
+    def __init__(self, config: OrphanAdoptionConfig) -> None:
+        """Initializes the adopter."""
+        self.config = config
+
+    def run(self) -> dict[str, Any]:
+        """Loads, adopts, validates, and writes all outputs."""
+        edited, segments, results = self.load()
+
+        decisions, final, hrus, report = self.adopt(
+            edited=edited,
+            segments=segments,
+            results=results,
+        )
+
+        self.write_outputs(
+            decisions=decisions,
+            final=final,
+            hrus=hrus,
+            report=report,
+        )
+
+        return report
+
+    def load(
+        self,
+    ) -> tuple[
+        gpd.GeoDataFrame,
+        gpd.GeoDataFrame,
+        pd.DataFrame | None,
+    ]:
+        """Reads the edited orphan layer, segments, and original results."""
+        edited = read_layer(
+            self.config.output_gpkg_path,
+            self.config.edited_layer,
+        )
+
+        segments = read_layer(
+            self.config.gpkg_path,
+            self.config.segment_layer,
+        )
+
+        results = None
+
+        if self.config.results_csv_path.exists():
+            results = pd.read_csv(
+                self.config.results_csv_path,
+                dtype=str,
+            )
+            results.columns = [str(c).lower() for c in results.columns]
+        else:
+            tqdm.write(
+                "Original results CSV not found; edits will not be "
+                "labeled as auto-accepted versus manual."
+            )
+
+        return edited, segments, results
+
+    @staticmethod
+    def _clean_id(value: Any) -> str | None:
+        """Normalizes an ID to a trimmed string, or None if blank."""
+        if value is None or pd.isna(value):
+            return None
+
+        text = str(value).strip()
+
+        if text == "" or text.lower() in {"none", "nan", "<na>"}:
+            return None
+
+        if text.endswith(".0") and text[:-2].isdigit():
+            text = text[:-2]
+
+        return text
+
+    @staticmethod
+    def _check_fields(
+        frame: pd.DataFrame,
+        required: tuple[str, ...],
+        label: str,
+    ) -> None:
+        """Raises if required fields are absent."""
+        missing = set(required) - set(frame.columns)
+
+        if missing:
+            raise KeyError(
+                f"{label} layer is missing required fields: "
+                f"{sorted(missing)}"
+            )
+
+    def _drop_blank_geometry(
+        self,
+        edited: gpd.GeoDataFrame,
+    ) -> tuple[gpd.GeoDataFrame, list[dict[str, Any]]]:
+        """Drops blank rows with no geometry and no catchment ID.
+
+        A feature with a catchment ID but no geometry is a damaged
+        catchment, so it raises instead of being silently dropped.
+        """
+        no_geometry = edited.geometry.isna() | edited.geometry.is_empty
+
+        if not no_geometry.any():
+            return edited, []
+
+        id_fields = [
+            field
+            for field in (
+                "catchment_id",
+                "source_id",
+                "routing_status",
+                "proposed_source_id",
+            )
+            if field in edited.columns
+        ]
+
+        blank = edited.loc[no_geometry, id_fields].copy()
+        has_id = blank["catchment_id"].map(self._clean_id).notna()
+
+        if has_id.any():
+            raise ValueError(
+                "These catchments have no geometry. Restore them from the "
+                "original layer so no catchment is lost:\n"
+                f"{blank[has_id].to_string(index=True)}"
+            )
+
+        tqdm.write(
+            f"WARNING: dropping {len(blank):,} blank feature(s) with no "
+            f"geometry and no catchment_id:\n{blank.to_string(index=True)}"
+        )
+
+        return (
+            edited.loc[~no_geometry].copy(),
+            blank.astype(str).to_dict("records"),
+        )
+
+    @staticmethod
+    def _cycle_sources(next_map: dict[str, str]) -> set[str]:
+        """Returns every source that lies on a routing cycle."""
+        state: dict[str, int] = {}
+        on_cycle: set[str] = set()
+
+        for start in next_map:
+            if state.get(start) == 2:
+                continue
+
+            path: list[str] = []
+            node: str | None = start
+
+            while node is not None and state.get(node, 0) == 0:
+                state[node] = 1
+                path.append(node)
+                node = next_map.get(node)
+
+            if node is not None and state.get(node) == 1:
+                on_cycle.update(path[path.index(node):])
+
+            for visited in path:
+                state[visited] = 2
+
+        return on_cycle
+
+    def adopt(
+        self,
+        edited: gpd.GeoDataFrame,
+        segments: gpd.GeoDataFrame,
+        results: pd.DataFrame | None,
+    ) -> tuple[
+        pd.DataFrame,
+        gpd.GeoDataFrame,
+        gpd.GeoDataFrame,
+        dict[str, Any],
+    ]:
+        """Applies proposed source IDs and builds the HRU layer.
+
+        Returns:
+            Per-orphan decision table, full final catchment layer, trimmed
+            PRMS HRU layer, and a JSON-compatible QA report.
+
+        Raises:
+            KeyError: If required fields are missing.
+            ValueError: If a catchment is damaged, or strict validation
+                finds invalid edits or routing cycles.
+        """
+        self._check_fields(edited, self.REQUIRED_EDITED_FIELDS, "edited")
+        self._check_fields(segments, self.REQUIRED_SEGMENT_FIELDS, "segments")
+
+        edited = edited.copy()
+        n_input = int(len(edited))
+
+        edited, dropped_rows = self._drop_blank_geometry(edited)
+
+        segment_by_source = {
+            self._clean_id(source): int(segment)
+            for source, segment in zip(
+                segments["source_id"],
+                pd.to_numeric(segments["segment_id"]),
+            )
+            if self._clean_id(source) is not None
+        }
+
+        own_source = edited["source_id"].map(self._clean_id)
+        known_sources = set(own_source.dropna()) | set(segment_by_source)
+
+        auto_source: dict[str, str | None] = {}
+
+        if results is not None and "assigned_source_id" in results.columns:
+            auto_source = {
+                str(c).strip(): self._clean_id(a)
+                for c, a in zip(
+                    results["catchment_id"],
+                    results["assigned_source_id"],
+                )
+            }
+
+        existing_next: dict[str, str] = {}
+
+        if "to_source_id" in edited.columns:
+            for source, target in zip(
+                own_source, edited["to_source_id"].map(self._clean_id)
+            ):
+                if source is not None and target is not None:
+                    existing_next[source] = target
+
+        orphan_mask = edited["routing_status"].isin(
+            self.config.orphan_statuses
+        )
+
+        records: list[dict[str, Any]] = []
+
+        for index, row in edited[orphan_mask].iterrows():
+            catchment_id = str(row["catchment_id"]).strip()
+            own = self._clean_id(row["source_id"])
+            target = self._clean_id(row["proposed_source_id"])
+
+            issue = None
+
+            if target is not None:
+                if target == own:
+                    issue = "self_route"
+                elif target not in known_sources:
+                    issue = "unknown_source_id"
+
+            records.append(
+                {
+                    "_index": index,
+                    "catchment_id": catchment_id,
+                    "source_id": own,
+                    "original_routing_status": str(row["routing_status"]),
+                    "auto_source_id": auto_source.get(catchment_id),
+                    "final_to_source_id": target,
+                    "final_to_segment_id": (
+                        segment_by_source.get(target)
+                        if target is not None
+                        else None
+                    ),
+                    "issue": issue,
+                }
+            )
+
+        proposed_next = {
+            r["source_id"]: r["final_to_source_id"]
+            for r in records
+            if r["issue"] is None
+            and r["final_to_source_id"] is not None
+            and r["source_id"] is not None
+        }
+
+        next_map = {**existing_next, **proposed_next}
+
+        cycle_sources = self._cycle_sources(next_map)
+
+        for record in records:
+            if record["issue"] is not None:
+                continue
+
+            node = record["source_id"]
+            seen: set[str] = set()
+
+            while (
+                record["final_to_source_id"] is not None
+                and node is not None
+                and node in next_map
+                and node not in seen
+            ):
+                seen.add(node)
+                node = next_map[node]
+
+                if node in cycle_sources:
+                    record["issue"] = "circular_routing"
+                    break
+
+        decisions = pd.DataFrame(
+            records,
+            columns=[
+                "_index",
+                "catchment_id",
+                "source_id",
+                "original_routing_status",
+                "auto_source_id",
+                "final_to_source_id",
+                "final_to_segment_id",
+                "issue",
+            ],
+        )
+
+        decisions["adopted"] = (
+            decisions["final_to_source_id"].notna()
+            & decisions["issue"].isna()
+        )
+
+        decisions["adoption_origin"] = [
+            self._origin(
+                adopted=bool(adopted),
+                issue=issue,
+                final=final_source,
+                auto=auto,
+                have_results=results is not None,
+            )
+            for adopted, issue, final_source, auto in zip(
+                decisions["adopted"],
+                decisions["issue"],
+                decisions["final_to_source_id"],
+                decisions["auto_source_id"],
+            )
+        ]
+
+        problems = decisions[decisions["issue"].notna()]
+
+        if not problems.empty and self.config.strict:
+            sample = problems[
+                ["catchment_id", "source_id", "final_to_source_id", "issue"]
+            ].head(10).to_string(index=False)
+
+            raise ValueError(
+                f"{len(problems):,} edited orphan record(s) are invalid. "
+                "Fix them or set strict=False to skip them.\n"
+                f"{sample}"
+            )
+
+        final = self._apply_routing(
+            edited=edited,
+            decisions=decisions,
+            segment_by_source=segment_by_source,
+            known_sources=known_sources,
+        )
+
+        final_next = self._next_map(final)
+        final_cycles = self._cycle_sources(final_next)
+
+        if final_cycles and self.config.strict:
+            raise ValueError(
+                f"{len(final_cycles):,} source(s) lie on a routing cycle "
+                f"after adoption, e.g. {sorted(final_cycles)[:5]}"
+            )
+
+        hrus, hru_stats = self._build_hrus(
+            final=final,
+            segment_by_source=segment_by_source,
+            next_map=final_next,
+        )
+
+        report = {
+            "n_catchments_input": n_input,
+            "n_catchments_output": int(len(final)),
+            "n_hrus": int(len(hrus)),
+            "dropped_blank_rows": dropped_rows,
+            "n_orphans": int(len(decisions)),
+            "n_adopted": int(decisions["adopted"].sum()),
+            "n_orphans_left_unrouted": int((~decisions["adopted"]).sum()),
+            "adoption_origin_counts": {
+                str(k): int(v)
+                for k, v in decisions["adoption_origin"]
+                .value_counts()
+                .items()
+            },
+            "issue_counts": {
+                str(k): int(v)
+                for k, v in decisions["issue"].value_counts().items()
+            },
+            "routing_status_counts": {
+                str(k): int(v)
+                for k, v in final["routing_status"].value_counts().items()
+            },
+            "n_sources_on_cycles": int(len(final_cycles)),
+            "duplicate_catchment_source_ids": int(
+                own_source.dropna().duplicated().sum()
+            ),
+            "n_segments": int(len(set(segment_by_source.values()))),
+            **hru_stats,
+        }
+
+        return decisions.drop(columns="_index"), final, hrus, report
+
+    @staticmethod
+    def _origin(
+        adopted: bool,
+        issue: str | None,
+        final: str | None,
+        auto: str | None,
+        have_results: bool,
+    ) -> str:
+        """Labels where an orphan's final routing came from."""
+        if issue is not None:
+            return "invalid_edit"
+
+        if not have_results:
+            return "adopted" if adopted else "unrouted"
+
+        if adopted:
+            if auto == final:
+                return "auto_accepted"
+
+            return "manual_changed" if auto is not None else "manual_added"
+
+        return "manual_removed" if auto is not None else "unrouted"
+
+    def _next_map(self, final: gpd.GeoDataFrame) -> dict[str, str]:
+        """Builds source -> to_source from the final catchment layer."""
+        sources = final["source_id"].map(self._clean_id)
+        targets = final["to_source_id"].map(self._clean_id)
+
+        return {
+            s: t
+            for s, t in zip(sources, targets)
+            if s is not None and t is not None
+        }
+
+    def _apply_routing(
+        self,
+        edited: gpd.GeoDataFrame,
+        decisions: pd.DataFrame,
+        segment_by_source: dict[str, int],
+        known_sources: set[str],
+    ) -> gpd.GeoDataFrame:
+        """Applies adopted routes and refreshes status for every catchment."""
+        final = edited.copy()
+
+        origin_by_index = dict(
+            zip(decisions["_index"], decisions["adoption_origin"])
+        )
+
+        final["adoption_origin"] = [
+            origin_by_index.get(index, "prepared") for index in final.index
+        ]
+
+        final["orphan_original_status"] = None
+
+        orphan_mask = final["routing_status"].isin(
+            self.config.orphan_statuses
+        )
+
+        final.loc[orphan_mask, "orphan_original_status"] = final.loc[
+            orphan_mask, "routing_status"
+        ]
+
+        if "is_active_hru" in final.columns:
+            final["was_active_hru"] = final["is_active_hru"]
+        else:
+            final["was_active_hru"] = 0
+
+        for column in (
+            "to_source_id",
+            "routing_target",
+            "routing_detail",
+            "manual_review",
+        ):
+            if column not in final.columns:
+                final[column] = None
+
+        final["to_segment_id"] = (
+            pd.to_numeric(final["to_segment_id"], errors="coerce")
+            .astype("Int64")
+            if "to_segment_id" in final.columns
+            else pd.Series(pd.NA, index=final.index, dtype="Int64")
+        )
+
+        for row in decisions[decisions["adopted"]].itertuples():
+            final.at[row._1, "to_source_id"] = row.final_to_source_id
+
+        adopted_indexes = set(decisions.loc[decisions["adopted"], "_index"])
+
+        for index in final.index:
+            target = self._clean_id(final.at[index, "to_source_id"])
+
+            if target is None or target not in known_sources:
+                continue
+
+            segment = segment_by_source.get(target)
+
+            if segment is not None:
+                final.at[index, "to_segment_id"] = int(segment)
+
+            final.at[index, "routing_target"] = (
+                f"segment {segment}"
+                if segment is not None
+                else f"source {target}"
+            )
+
+            previous = final.at[index, "orphan_original_status"]
+
+            if index in adopted_indexes:
+                final.at[index, "routing_detail"] = (
+                    f"orphan routed to source {target} "
+                    f"({final.at[index, 'adoption_origin']})"
+                )
+                final.at[index, "manual_review"] = 0
+            elif previous is not None and not pd.isna(previous):
+                final.at[index, "routing_detail"] = (
+                    f"existing to_source_id {target} applied "
+                    f"(was {previous})"
+                )
+
+            final.at[index, "routing_status"] = "routed"
+
+        final["is_active_hru"] = 1
+
+        return final
+
+    def _resolve_segment(
+        self,
+        start: str | None,
+        next_map: dict[str, str],
+        segment_by_source: dict[str, int],
+    ) -> int:
+        """Follows to_source links to the first model segment, else 0."""
+        node = next_map.get(start) if start is not None else None
+        visited = {start}
+
+        while node is not None and node not in visited:
+            if node in segment_by_source:
+                return int(segment_by_source[node])
+
+            visited.add(node)
+            node = next_map.get(node)
+
+        return 0
+
+    def _build_hrus(
+        self,
+        final: gpd.GeoDataFrame,
+        segment_by_source: dict[str, int],
+        next_map: dict[str, str],
+    ) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
+        """Builds the trimmed PRMS HRU layer from every catchment."""
+        if final.crs is None or not final.crs.is_projected:
+            raise ValueError(
+                "Catchments must be in a projected CRS to calculate "
+                "hru_area."
+            )
+
+        unit_name = str(final.crs.axis_info[0].unit_name).lower()
+
+        if not unit_name.startswith("met"):
+            raise ValueError(
+                f"hru_area assumes a metric CRS; found unit '{unit_name}'."
+            )
+
+        own_source = final["source_id"].map(self._clean_id)
+
+        hru_segment: list[int] = []
+        own_count = 0
+        chain_count = 0
+
+        for source in own_source:
+            if source is not None and source in segment_by_source:
+                hru_segment.append(int(segment_by_source[source]))
+                own_count += 1
+                continue
+
+            resolved = self._resolve_segment(
+                source,
+                next_map,
+                segment_by_source,
+            )
+            chain_count += int(resolved > 0)
+            hru_segment.append(resolved)
+
+        centroids = gpd.GeoSeries(
+            final.geometry.centroid,
+            crs=final.crs,
+        ).to_crs(4326)
+
+        hru_type = np.ones(len(final), dtype=int)
+
+        if (
+            self.config.lake_waterbody_fraction is not None
+            and "waterbody_frac" in final.columns
+        ):
+            fraction = pd.to_numeric(
+                final["waterbody_frac"], errors="coerce"
+            ).fillna(0.0)
+            hru_type[
+                (fraction >= self.config.lake_waterbody_fraction).to_numpy()
+            ] = 2
+
+        table = pd.DataFrame(
+            {
+                "catchment_id": final["catchment_id"].astype(str).values,
+                "source_id": own_source.values,
+                "hru_segment": hru_segment,
+                "hru_area": (
+                    final.geometry.area.values / self.config.ACRE_M2
+                ),
+                "hru_lat": np.round(centroids.y.values, 6),
+                "hru_lon": np.round(centroids.x.values, 6),
+                "hru_type": hru_type,
+            }
+        )
+
+        for field in self.config.extra_hru_fields:
+            if field in final.columns:
+                table[field] = final[field].values
+
+        hrus = gpd.GeoDataFrame(
+            table,
+            geometry=final.geometry.values,
+            crs=final.crs,
+        )
+
+        hrus = hrus.sort_values(
+            ["hru_segment", "source_id", "catchment_id"],
+            na_position="last",
+        ).reset_index(drop=True)
+
+        hrus.insert(0, "hru_id", np.arange(1, len(hrus) + 1, dtype=int))
+
+        used_segments = set(hrus["hru_segment"]) - {0}
+        all_segments = set(segment_by_source.values())
+
+        stats = {
+            "hrus_with_own_segment": int(own_count),
+            "hrus_routed_via_chain": int(chain_count),
+            "hrus_with_no_segment_hru_segment_0": int(
+                (hrus["hru_segment"] == 0).sum()
+            ),
+            "segments_without_hru": int(len(all_segments - used_segments)),
+            "total_hru_area_acres": round(float(hrus["hru_area"].sum()), 2),
+            "total_hru_area_km2": round(
+                float(hrus["hru_area"].sum())
+                * self.config.ACRE_M2
+                / 1_000_000.0,
+                3,
+            ),
+            "hrus_below_min_area_0_0001_acres": int(
+                (hrus["hru_area"] < 0.0001).sum()
+            ),
+        }
+
+        return hrus, stats
+
+    def write_outputs(
+        self,
+        decisions: pd.DataFrame,
+        final: gpd.GeoDataFrame,
+        hrus: gpd.GeoDataFrame,
+        report: dict[str, Any],
+    ) -> None:
+        """Writes the catchment layer, HRU layer, CSVs, and JSON report."""
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        catchment_out = validate_output_layer(
+            final,
+            layer_name=self.config.output_catchment_layer,
+            expected_geometry_types=("Polygon", "MultiPolygon"),
+        )
+
+        write_layer(
+            catchment_out,
+            self.config.output_gpkg_path,
+            self.config.output_catchment_layer,
+        )
+
+        hru_out = validate_output_layer(
+            hrus,
+            layer_name=self.config.output_hru_layer,
+            expected_geometry_types=("Polygon", "MultiPolygon"),
+        )
+
+        write_layer(
+            hru_out,
+            self.config.output_gpkg_path,
+            self.config.output_hru_layer,
+        )
+
+        hrus.drop(columns="geometry").to_csv(
+            self.config.output_dir / "hrus_orphan_adopted.csv",
+            index=False,
+        )
+
+        decisions.to_csv(
+            self.config.output_dir / "orphan_adoption_decisions.csv",
+            index=False,
+        )
+
+        (
+            self.config.output_dir / "orphan_adoption_report.json"
+        ).write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+
+        tqdm.write(
+            f"Adopted {report['n_adopted']:,} of {report['n_orphans']:,} "
+            f"orphans. HRUs written: {report['n_hrus']:,} "
+            f"({report['hrus_with_no_segment_hru_segment_0']:,} with "
+            f"hru_segment 0)."
+        )
 
 
 def main() -> None:
@@ -3473,8 +4448,6 @@ def main() -> None:
         updated_catchments=updated_catchments,
     )
 
-    router.plot_orphan_routing_map(results=results)
-
     if results.empty:
         print(
             "\nNo catchments matched the configured "
@@ -3502,10 +4475,28 @@ def main() -> None:
             f"{int(results['sink_recovery_success'].sum()):,}"
         )
 
+    router.plot_orphan_routing_map(results=results)
+
     print("\n" + "=" * 78)
     print("ORPHAN CATCHMENT ROUTING COMPLETE")
     print("=" * 78)
 
 
+def main_adopt() -> None:
+    """Adopts manually edited orphan routing into new final layers."""
+    domain = Path(
+        r"C:\Users\CND367\Documents\Python_Scripts\PRMS"
+        r"\PRMS_Gallatin\Domain_Builder\Domain_Files"
+    )
+
+    config = OrphanAdoptionConfig(
+        gpkg_path=domain / "PlusHR_UG.gdb",
+        output_gpkg_path=domain / "PlusHR_UG.gdb",
+        output_dir=domain / "orphan_routing",
+        strict=True,
+    )
+
+    OrphanRoutingAdopter(config).run()
+
 if __name__ == "__main__":
-    main()
+    main_adopt()
