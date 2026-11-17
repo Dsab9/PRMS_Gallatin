@@ -54,7 +54,7 @@ import numpy as np
 import pandas as pd
 from fiona import listlayers, remove
 from pynhd import NHDPlusHR, NLDI, WaterData
-from shapely.geometry import box
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
@@ -97,12 +97,14 @@ class NHDPlusHRConfig:
         retry_seconds: float = 10.0,
     ) -> None:
         """Initializes NHDPlus HR preparation configuration."""
-        self.huc12 = str(huc12)
+        self.huc12 = str(huc12).strip()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.gpkg_name = str(gpkg_name)
-        self.extra_huc12 = [str(value) for value in (extra_huc12 or [])]
+        self.extra_huc12 = [
+            str(value).strip() for value in (extra_huc12 or [])
+        ]
         self.download_layers = self.validate_layers(
             download_layers or self.VALID_LAYERS,
             "download_layers",
@@ -202,6 +204,34 @@ def safe_layer_name(name: str) -> str:
         Lowercase alphanumeric/underscore layer name.
     """
     return re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")
+
+
+def polygon_parts(geometry: BaseGeometry | None) -> list[Polygon]:
+    """Splits any geometry into a flat list of non-empty Polygons.
+
+    The pynhd/pygeoogc service accepts Polygon but not MultiPolygon or
+    GeometryCollection, so multipart geometries must be split before a
+    request is made. Non-polygon pieces (points, lines) are discarded.
+
+    Args:
+        geometry: Polygon, MultiPolygon, GeometryCollection, or None.
+
+    Returns:
+        List of single-part Polygons.
+    """
+    if geometry is None or geometry.is_empty:
+        return []
+
+    if isinstance(geometry, Polygon):
+        return [geometry]
+
+    if isinstance(geometry, (MultiPolygon, GeometryCollection)):
+        parts: list[Polygon] = []
+        for part in geometry.geoms:
+            parts.extend(polygon_parts(part))
+        return parts
+
+    return []
 
 
 def list_gpkg_layers(path: Path) -> list[str]:
@@ -373,6 +403,13 @@ class NHDPlusHRDownloader:
 
             result["failed_requests"] += failures
 
+            if failures and not self._raw_layers(source_layer):
+                raise RuntimeError(
+                    f"Every {source_layer} request failed "
+                    f"({failures} failures). See "
+                    f"{self.config.failure_log_path} for details."
+                )
+
             merged = self.merge_saved_chunks(source_layer)
             result[f"{source_layer}_count"] = len(merged)
 
@@ -534,7 +571,8 @@ class NHDPlusHRDownloader:
 
         if not raw_layers:
             raise RuntimeError(
-                f"No raw chunks available for {source_layer}."
+                f"No raw chunks available for {source_layer}. "
+                f"Check {self.config.failure_log_path} for failed requests."
             )
 
         unique_id = (
@@ -639,11 +677,88 @@ class NHDPlusHRDownloader:
         source_layer: str,
         huc12: str,
     ) -> gpd.GeoDataFrame | None:
-        """Requests one NHDPlus HR geometry with retry handling.
+        """Requests an NHDPlus HR geometry, splitting multipart polygons.
+
+        The web service accepts only single-part Polygons, so MultiPolygon
+        and GeometryCollection inputs are split and requested part by part.
+        Results are concatenated and de-duplicated.
 
         Args:
             service: Initialized NHDPlusHR service.
-            geometry: Query polygon.
+            geometry: Query geometry (Polygon, MultiPolygon, or collection).
+            source_layer: Service-layer label.
+            huc12: Source HUC12 code.
+
+        Returns:
+            Combined query result or None if zero matching features occur.
+
+        Raises:
+            RuntimeError: If any polygon part fails after all retries.
+        """
+        parts = polygon_parts(geometry)
+
+        if not parts:
+            raise RuntimeError(
+                f"{source_layer} request failed for HUC12 {huc12}. "
+                f"Final cause: geometry contains no polygon parts "
+                f"({geometry.geom_type if geometry is not None else None})."
+            )
+
+        frames: list[gpd.GeoDataFrame] = []
+
+        for part in parts:
+            frame = self._request_single_polygon(
+                service=service,
+                polygon=part,
+                source_layer=source_layer,
+                huc12=huc12,
+            )
+
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+
+        if not frames:
+            return None
+
+        if len(frames) == 1:
+            return frames[0]
+
+        combined = gpd.GeoDataFrame(
+            pd.concat(frames, ignore_index=True),
+            crs=frames[0].crs,
+        )
+
+        id_column = next(
+            (
+                column
+                for column in combined.columns
+                if column.lower() in ("nhdplusid", "permanent_identifier")
+            ),
+            None,
+        )
+
+        if id_column is not None:
+            combined = combined.drop_duplicates(
+                subset=id_column,
+                keep="first",
+            ).copy()
+
+        return combined
+
+    def _request_single_polygon(
+        self,
+        service: NHDPlusHR,
+        polygon: Polygon,
+        source_layer: str,
+        huc12: str,
+    ) -> gpd.GeoDataFrame | None:
+        """Requests one single-part polygon with retry handling.
+
+        Deterministic input errors are not retried.
+
+        Args:
+            service: Initialized NHDPlusHR service.
+            polygon: Single-part query polygon.
             source_layer: Service-layer label.
             huc12: Source HUC12 code.
 
@@ -657,12 +772,15 @@ class NHDPlusHRDownloader:
 
         for attempt in range(self.config.max_retries + 1):
             try:
-                return service.bygeom(geometry)
+                return service.bygeom(polygon)
             except Exception as error:  # noqa: BLE001
                 last_error = error
 
                 if self._is_zero_match_error(error):
                     return None
+
+                if self._is_input_error(error):
+                    break
 
                 if attempt < self.config.max_retries:
                     pause = self.config.retry_seconds * (attempt + 1)
@@ -711,7 +829,7 @@ class NHDPlusHRDownloader:
                 )
 
                 tile = candidate.intersection(geometry)
-                if not tile.is_empty:
+                if polygon_parts(tile):
                     tiles.append(tile)
 
         service = NHDPlusHR("catchment")
@@ -900,6 +1018,14 @@ class NHDPlusHRDownloader:
             or "zero matched" in text
             or "no features" in text
             or "no records" in text
+        )
+
+    @staticmethod
+    def _is_input_error(error: Exception) -> bool:
+        """Returns True if an error is a deterministic bad-input error."""
+        return (
+            type(error).__name__ == "InputTypeError"
+            or isinstance(error, (TypeError, ValueError))
         )
 
     @staticmethod
@@ -1255,16 +1381,16 @@ class LocalNHDPlusHRLoader:
 def main() -> None:
     """Downloads/loads NHDPlus HR data and writes prepared routing layers."""
     config = NHDPlusHRConfig(
-        huc12="100200080507",
+        huc12="100200081401",
         output_dir=Path(
             r"C:\Users\CND367\Documents\Python_Scripts\PRMS"
-            r"\PRMS_Gallatin\Domain_Builder\Domain_Files"
+            r"\PRMS_Gallatin\Domain_Builder\HUC8"
         ),
         gpkg_name="nhdhr.gpkg",
 
         # Change these as needed:
-        download_layers=("waterbody",),
-        load_layers=("flowline", "catchment", "waterbody"),
+        download_layers=("flowline", "catchment", "waterbody"),
+        # load_layers=(),
 
         # If Arc Pro catchments are in another datasource, set source_path
         # and map the physical layer name here:
@@ -1288,6 +1414,13 @@ def main() -> None:
 
     print("Download result:")
     print(json.dumps(download_result, indent=2))
+
+    if download_result.get("failed_requests", 0):
+        print(
+            f"\nWARNING: {download_result['failed_requests']} request(s) "
+            f"failed. See {config.failure_log_path}. Rerun to retry only "
+            f"the missing HUC12 chunks."
+        )
 
     loader = LocalNHDPlusHRLoader(config)
 

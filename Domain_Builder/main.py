@@ -114,7 +114,7 @@ RUN_DOWNLOAD = False
 #   prepared_catchments
 #   prepared_waterbodies
 #   prepared_huc12
-RUN_PREPARE = True
+RUN_PREPARE = False
 
 # Set True to create or refresh:
 #   model_segments

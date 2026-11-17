@@ -135,6 +135,8 @@ class RoutingConfig:
         catchment_layer: str = "prepared_catchments",
         waterbody_layer: str = "prepared_waterbodies",
         huc12_layer: str = "prepared_huc12",
+        omit_canal_ditch: bool = False,
+        canal_ditch_field: str | None = None,
     ) -> None:
         """Initializes source-agnostic routing configuration."""
         self.gpkg_path = Path(gpkg_path)
@@ -158,6 +160,8 @@ class RoutingConfig:
         self.catchment_layer = str(catchment_layer)
         self.waterbody_layer = str(waterbody_layer)
         self.huc12_layer = str(huc12_layer)
+        self.omit_canal_ditch = bool(omit_canal_ditch)
+        self.canal_ditch_field = canal_ditch_field
 
     @property
     def output_dir(self) -> Path:
@@ -634,6 +638,11 @@ class DendriticRouter:
         """
         self.config = config
         self.flowlines = flowlines.copy()
+        self.canal_stats: dict[str, Any] = {}
+        if config.omit_canal_ditch:
+            self.flowlines, self.canal_stats = self.drop_canal_ditch(
+                self.flowlines
+            )
         self.catchments = catchments.copy()
 
         if waterbodies is None:
@@ -697,6 +706,8 @@ class DendriticRouter:
             graph=graph,
             outlet_source_id=outlet_source_id,
         )
+
+        report.update(self.canal_stats)
 
         self._write_outputs(
             segments=segments,
@@ -904,6 +915,79 @@ class DendriticRouter:
         segments["length_m"] = segments.geometry.length
 
         return segments, source_to_segment
+
+
+    def find_canal_mask(self, flowlines: gpd.GeoDataFrame) -> tuple[pd.Series, str]:
+        """Flags CanalDitch flowlines by text label or NHD FType code 336.
+
+        Raises:
+            KeyError: If no usable type field is present.
+        """
+        candidates = (
+            [self.config.canal_ditch_field]
+            if self.config.canal_ditch_field
+            else ["source_type", "ftype"]
+        )
+        for field in candidates:
+            if field in flowlines.columns:
+                norm = (
+                    flowlines[field]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .str.replace(r"\.0$", "", regex=True)
+                    .str.replace(r"[^a-z0-9]", "", regex=True)
+                )
+                return norm.isin({"canalditch", "336"}), field
+        raise KeyError(
+            f"omit_canal_ditch needs one of {candidates} in prepared_flowlines."
+        )
+
+    def drop_canal_ditch(
+        self, flowlines: gpd.GeoDataFrame, max_hops: int = 50
+    ) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
+        """Removes CanalDitch flowlines and relinks upstream flowlines.
+
+        Flowlines that drained into a removed canal are pointed at the first
+        retained flowline downstream. If none exists they become sinks.
+        """
+        mask, field = self.find_canal_mask(flowlines)
+        removed = set(flowlines.loc[mask, "source_id"].astype(str))
+
+        to_map = {
+            str(s): (None if pd.isna(t) else str(t))
+            for s, t in zip(flowlines["source_id"], flowlines["to_source_id"])
+        }
+
+        def next_kept(start: str | None) -> str | None:
+            node, seen, hops = start, set(), 0
+            while node in removed and node not in seen and hops < max_hops:
+                seen.add(node)
+                node = to_map.get(node)
+                hops += 1
+            return None if node in removed else node
+
+        kept = flowlines.loc[~mask].copy()
+        to_ids = kept["to_source_id"].astype(object)
+        affected = to_ids.astype(str).isin(removed) & to_ids.notna()
+
+        relinked = {
+            idx: next_kept(str(to_ids.loc[idx])) for idx in kept.index[affected]
+        }
+        for idx, new_to in relinked.items():
+            kept.at[idx, "to_source_id"] = new_to if new_to else pd.NA
+
+        stats = {
+            "canal_ditch_field": field,
+            "n_canal_ditch_removed": int(mask.sum()),
+            "n_relinked_past_canal": int(sum(v is not None for v in relinked.values())),
+            "n_became_sink_after_canal_removal": int(
+                sum(v is None for v in relinked.values())
+            ),
+        }
+        tqdm.write(f"CanalDitch removal: {stats}")
+        return kept, stats
+
 
     def _build_catchment_layers(
         self,
@@ -1679,18 +1763,19 @@ def main() -> None:
     """Loads prepared layers and writes source-agnostic routing outputs."""
     gpkg_path = Path(
         r"C:\Users\CND367\Documents\Python_Scripts\PRMS"
-        r"\PRMS_Gallatin\Domain_Builder\Domain_Files"
-        r"\PlusHR_UG.gdb"
+        r"\PRMS_Gallatin\Domain_Builder\HUC8"
+        r"\nhdhr.gpkg"
     )
 
     config = RoutingConfig(
         gpkg_path=gpkg_path,
-        target_huc12="100200080507",
-        flowline_layer="prepared_flowlines_topology_repaired",
-        catchment_layer="prepared_catchments_topology_repaired",
-        outlet_source_id="23002900012900",
+        target_huc12="100200081401",
+        flowline_layer="prepared_flowlines",
+        catchment_layer="prepared_catchments",
+        outlet_source_id="23002900047631",
         work_crs="EPSG:5070",
         min_hru_area_m2=0.0,
+        omit_canal_ditch=True
     )
 
     loader = PreparedDomainLoader(config)
